@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "react-toastify";
-import axiosInstance from "../axiosconfig";
+import axiosInstance from "../api/axiosconfig";
 
 export const useWebRTC = ({
   userId,

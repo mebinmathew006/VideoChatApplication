@@ -2,7 +2,6 @@ import axios from "axios";
 import store from "../store/store";
 import {
   destroyDetails,
-  setUserDetails,
   updateAccessToken,
 } from "../store/UserDetailsSlice";
 import history from "../../History";
@@ -38,8 +37,8 @@ axiosInstance.interceptors.response.use(
 
     // Skip processing for auth-related endpoints
     if (
-      originalRequest.url?.includes("api/v1/refresh_token") ||
-      originalRequest.url?.includes("/login")
+      originalRequest.url?.includes("api/v1/auth/refresh") ||
+      originalRequest.url?.includes("api/v1/login")
     ) {
       return Promise.reject(error);
     }
@@ -51,7 +50,7 @@ axiosInstance.interceptors.response.use(
       try {
         // Refresh token request
         const refreshResponse = await axios.post(
-          `${baseurl}/users/refresh_token`,
+          `${baseurl}/v1/auth/refresh`,
           {},
           { withCredentials: true }
         );
@@ -76,7 +75,7 @@ axiosInstance.interceptors.response.use(
         store.dispatch(destroyDetails());
         try {
           await axios.post(
-            `${baseurl}/users/logout`,
+            `${baseurl}/v1/logout`,
             {},
             { withCredentials: true }
           );
@@ -91,7 +90,7 @@ axiosInstance.interceptors.response.use(
         });
 
         // Redirect to login
-        history.push("/login");
+        history.push("/");
         return Promise.reject(refreshError);
       }
     }

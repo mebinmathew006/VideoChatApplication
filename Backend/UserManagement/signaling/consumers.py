@@ -1,274 +1,404 @@
+# consumers.py
 import json
-import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
-from User.models import Room, RoomParticipant
+from django.contrib.auth import get_user_model
+from django.core.files.base import ContentFile
+from User.models import Message, Attachment
+import base64
+from datetime import datetime, timedelta
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
+import jwt
+from django.conf import settings
 
-logger = logging.getLogger(__name__)
+User = get_user_model()
 
-class RoomManager:
-    _rooms = {}  
-    
-    @classmethod
-    def add_participant(cls, room_id, user_id, channel_name):
-        if room_id not in cls._rooms:
-            cls._rooms[room_id] = {'participants': {}}
-        cls._rooms[room_id]['participants'][user_id] = channel_name
-        logger.info(f"Added {user_id} to room {room_id}. Total: {len(cls._rooms[room_id]['participants'])}")
-    
-    @classmethod
-    def remove_participant(cls, room_id, user_id):
-        if room_id in cls._rooms and user_id in cls._rooms[room_id]['participants']:
-            del cls._rooms[room_id]['participants'][user_id]
-            logger.info(f"Removed {user_id} from room {room_id}")
-            
-            # Clean up empty rooms
-            if not cls._rooms[room_id]['participants']:
-                del cls._rooms[room_id]
-                logger.info(f"Room {room_id} deleted (empty)")
-    
-    @classmethod
-    def get_participants(cls, room_id, exclude_user=None):
-        if room_id not in cls._rooms:
-            return []
-        participants = list(cls._rooms[room_id]['participants'].keys())
-        if exclude_user:
-            participants = [p for p in participants if p != exclude_user]
-        return participants
-    
-    @classmethod
-    def get_participant_channel(cls, room_id, user_id):
-        if room_id in cls._rooms and user_id in cls._rooms[room_id]['participants']:
-            return cls._rooms[room_id]['participants'][user_id]
-        return None
-    
-    @classmethod
-    def find_user_room(cls, channel_name):
-        for room_id, room_data in cls._rooms.items():
-            for user_id, ch_name in room_data['participants'].items():
-                if ch_name == channel_name:
-                    return room_id, user_id
-        return None, None
-
-class SignalingConsumer(AsyncWebsocketConsumer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.room_id = None
-        self.user_id = None
-        self.room_group_name = None
-
+class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        await self.accept()
-        logger.info(f"WebSocket connection accepted: {self.channel_name}")
-
-    async def disconnect(self, close_code):
-        # Find user's room if not already known
-        if not self.room_id or not self.user_id:
-            self.room_id, self.user_id = RoomManager.find_user_room(self.channel_name)
+        self.room_id = self.scope['url_route']['kwargs']['room_id']
+        self.room_group_name = f'chat_{self.room_id}'
         
-        # Leave room group
-        if self.room_group_name:
-            await self.channel_layer.group_discard(
-                self.room_group_name,
-                self.channel_name
-            )
-            
-            # Notify other participants that user left
-            if self.user_id:
-                await self.channel_layer.group_send(
-                    self.room_group_name,
-                    {
-                        'type': 'user_left',
-                        'user_id': self.user_id
-                    }
-                )
-                
-                # Update database and in-memory storage
-                await self.mark_user_disconnected()
-                RoomManager.remove_participant(self.room_id, self.user_id)
+        token = self.scope['query_string'].decode().split('token=')[-1] if 'token=' in self.scope['query_string'].decode() else None
         
-        logger.info(f"WebSocket disconnected: {self.channel_name}")
-
-    async def receive(self, text_data):
-        try:
-            data = json.loads(text_data)
-            message_type = data.get('type')
-            
-            logger.info(f"Received message: {message_type} from {self.user_id}")
-            
-            if message_type == 'join-room':
-                await self.handle_join_room(data)
-            elif message_type == 'leave-room':
-                await self.handle_leave_room(data)
-            elif message_type in ['offer', 'answer', 'ice-candidate']:
-                await self.handle_webrtc_message(data)
-            else:
-                logger.warning(f"Unknown message type: {message_type}")
-                
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON received")
-        except Exception as e:
-            logger.error(f"Error processing message: {str(e)}")
-
-    async def handle_join_room(self, data):
-        self.room_id = data.get('data', {}).get('roomId')
-        self.user_id = data.get('userId') or self.generate_user_id()
+        self.user = await self.authenticate_user(token)
         
-        if not self.room_id:
-            await self.send_error("Room ID is required")
+        if not self.user or not self.user.is_authenticated:
+            await self.send(text_data=json.dumps({
+                'type': 'auth_error',
+                'message': 'Authentication failed'
+            }))
+            await self.close(code=4001)  
             return
-        
-        self.room_group_name = f'room_{self.room_id}'
-        
-        # Join room group
+
         await self.channel_layer.group_add(
             self.room_group_name,
             self.channel_name
         )
-        
-        # Get existing participants before adding new one
-        existing_participants = RoomManager.get_participants(self.room_id, exclude_user=self.user_id)
-        
-        # Add to in-memory room management
-        RoomManager.add_participant(self.room_id, self.user_id, self.channel_name)
-        
-        # Create or get room in database
-        await self.create_or_get_room()
-        
-        # Add participant to database
-        await self.add_participant_to_room()
-        
-        # Notify existing participants about new user
+
+        await self.accept()
+
+        await self.send(text_data=json.dumps({
+            'type': 'connection_established',
+            'message': 'Connected to chat',
+            'user_id': self.user.id,
+            'room_id': self.room_id
+        }))
+
+        initial_messages = await self.get_messages(limit=50, offset=0)
+        await self.send(text_data=json.dumps({
+            'type': 'message_history',
+            'messages': initial_messages,
+            'total': await self.get_total_messages()
+        }))
+
         await self.channel_layer.group_send(
             self.room_group_name,
             {
-                'type': 'user_joined',
-                'user_id': self.user_id,
-                'sender_channel': self.channel_name
+                'type': 'user_join',
+                'user_id': self.user.id,
+                'user_name': getattr(self.user, "name", self.user.name),
+                'timestamp': datetime.now().isoformat()
             }
         )
         
-        # Send existing participants list to new user
-        await self.send(text_data=json.dumps({
-            'type': 'room-joined',
-            'data': {
-                'roomId': self.room_id,
-                'userId': self.user_id,
-                'participants': existing_participants
-            }
-        }))
-        
-        logger.info(f"User {self.user_id} joined room {self.room_id}")
-
-    async def handle_leave_room(self, data):
-        if self.room_group_name:
-            await self.channel_layer.group_discard(
-                self.room_group_name,
-                self.channel_name
-            )
-            
+    async def disconnect(self, close_code):
+        """Handle WebSocket disconnection"""
+        if self.user and self.user.is_authenticated:
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
-                    'type': 'user_left',
-                    'user_id': self.user_id
+                    'type': 'user_leave',
+                    'user_id': self.user.id,
+                    'user_name': getattr(self.user, "name", self.user.name),
+                    'timestamp': datetime.now().isoformat()
                 }
             )
-            
-            await self.mark_user_disconnected()
-            RoomManager.remove_participant(self.room_id, self.user_id)
         
-        self.room_id = None
-        self.user_id = None
-        self.room_group_name = None
+        await self.channel_layer.group_discard(
+            self.room_group_name,
+            self.channel_name
+        )
 
-    async def handle_webrtc_message(self, data):
-        if not self.room_group_name:
-            await self.send_error("Not in a room")
+    async def receive(self, text_data):
+        """Handle incoming WebSocket messages"""
+        try:
+            data = json.loads(text_data)
+            message_type = data.get('type', 'message')
+            
+            if message_type == 'message':
+                await self.handle_chat_message(data)
+            elif message_type == 'join':
+                pass
+            elif message_type == 'typing':
+                await self.handle_typing(data)
+            elif message_type == 'fetch_messages':
+                await self.handle_fetch_messages(data)
+            elif message_type == 'read_receipt':
+                await self.handle_read_receipt(data)
+            elif message_type == 'refresh_token':
+                await self.handle_refresh_token(data)
+                
+        except json.JSONDecodeError:
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Invalid JSON format'
+            }))
+        except Exception as e:
+            print(f"Error in receive: {str(e)}")
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': str(e)
+            }))
+
+    async def handle_chat_message(self, data):
+        """Handle chat message with attachments"""
+        message_text = data.get('message', '')
+        media = data.get('media', [])
+        
+        if not message_text.strip() and not media:
             return
         
-        # Forward WebRTC signaling messages to specific peer
-        target_user = data.get('to')
-        if target_user:
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    'type': 'webrtc_message',
-                    'message_type': data.get('type'),
-                    'from_user': self.user_id,
-                    'to_user': target_user,
-                    'data': data.get('data', {}),
-                    'sender_channel': self.channel_name
-                }
-            )
-
-    async def user_joined(self, event):
-        # Don't send to the user who just joined
-        if event.get('sender_channel') != self.channel_name:
-            await self.send(text_data=json.dumps({
-                'type': 'user-joined',
-                'data': {
-                    'userId': event['user_id']
-                }
-            }))
-
-    async def user_left(self, event):
-        await self.send(text_data=json.dumps({
-            'type': 'user-left',
-            'data': {
-                'userId': event['user_id']
+        message = await self.save_message(message_text, media)
+        
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'chat_message_broadcast',
+                'message': message
             }
-        }))
+        )
 
-    async def webrtc_message(self, event):
-        # Only send to the target user
-        if event.get('to_user') == self.user_id and event.get('sender_channel') != self.channel_name:
+    async def handle_typing(self, data):
+        """Handle typing indicator"""
+        is_typing = data.get('is_typing', False)
+        
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'typing_indicator',
+                'user_id': self.user.id,
+                'user_name': getattr(self.user, "name", self.user.name),
+                'is_typing': is_typing
+            }
+        )
+
+    async def handle_fetch_messages(self, data):
+        """Handle pagination - fetch older messages"""
+        try:
+            limit = min(int(data.get('limit', 20)), 50)  # Limit to 50 max
+            offset = int(data.get('offset', 0))
+            
+            messages = await self.get_messages(limit=limit, offset=offset)
+            total = await self.get_total_messages()
+            
             await self.send(text_data=json.dumps({
-                'type': event['message_type'],
-                'from': event['from_user'],
-                'to': event['to_user'],
-                'data': event['data']
+                'type': 'message_history',
+                'messages': messages,
+                'total': total,
+                'offset': offset,
+                'limit': limit,
+                'has_more': offset + len(messages) < total
+            }))
+        except Exception as e:
+            print(f"Error fetching messages: {e}")
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Failed to load messages'
             }))
 
-    async def send_error(self, message):
+    async def handle_read_receipt(self, data):
+        """Handle message read receipts"""
+        message_id = data.get('message_id')
+        
+        await self.mark_message_read(message_id)
+        
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'read_receipt_broadcast',
+                'message_id': message_id,
+                'user_id': self.user.id,
+                'timestamp': datetime.now().isoformat()
+            }
+        )
+
+    async def handle_refresh_token(self, data):
+        """Handle token refresh"""
+        refresh_token = data.get('refresh_token')
+        
+        if not refresh_token:
+            await self.send(text_data=json.dumps({
+                'type': 'token_error',
+                'message': 'No refresh token provided'
+            }))
+            return
+        
+        try:
+            new_tokens = await self.refresh_access_token(refresh_token)
+            await self.send(text_data=json.dumps({
+                'type': 'token_refreshed',
+                'access_token': new_tokens['access'],
+                'refresh_token': new_tokens['refresh']
+            }))
+        except Exception as e:
+            await self.send(text_data=json.dumps({
+                'type': 'token_error',
+                'message': str(e)
+            }))
+
+    # Broadcast handlers
+    async def chat_message_broadcast(self, event):
+        """Send chat message to WebSocket"""
         await self.send(text_data=json.dumps({
-            'type': 'error',
-            'message': message
+            'type': 'chat_message',
+            'id': event['message']['id'],
+            'username': event['message']['sender_name'],
+            'message': event['message']['message'],
+            'media': event['message'].get('media', []),
+            'sender_id': event['message']['sender_id'],
+            'timestamp': event['message']['created_at']
         }))
 
-    def generate_user_id(self):
-        import uuid
-        return str(uuid.uuid4())[:8]
+    async def typing_indicator(self, event):
+        """Send typing indicator to WebSocket"""
+        if event['user_id'] != self.user.id:
+            await self.send(text_data=json.dumps({
+                'type': 'typing',
+                'user_id': event['user_id'],
+                'user_name': event['user_name'],
+                'is_typing': event['is_typing']
+            }))
 
-    @database_sync_to_async
-    def create_or_get_room(self):
-        room, created = Room.objects.get_or_create(
-            room_id=self.room_id,
-            defaults={'is_active': True}
-        )
-        return room
+    async def user_join(self, event):
+        """Send user join notification"""
+        if event['user_id'] != self.user.id:
+            await self.send(text_data=json.dumps({
+                'type': 'user_join',
+                'message': f"{event['user_name']} joined the chat",
+                'user_id': event['user_id'],
+                'user_name': event['user_name'],
+                'timestamp': event['timestamp']
+            }))
 
-    @database_sync_to_async
-    def add_participant_to_room(self):
-        room = Room.objects.get(room_id=self.room_id)
-        participant, created = RoomParticipant.objects.get_or_create(
-            room=room,
-            user_id=self.user_id,
-            defaults={'is_connected': True}
-        )
-        if not created:
-            participant.is_connected = True
-            participant.save()
-        return participant
+    async def user_leave(self, event):
+        """Send user leave notification"""
+        if event['user_id'] != self.user.id:
+            await self.send(text_data=json.dumps({
+                'type': 'user_leave',
+                'message': f"{event['user_name']} left the chat",
+                'user_id': event['user_id'],
+                'user_name': event['user_name'],
+                'timestamp': event['timestamp']
+            }))
 
-    @database_sync_to_async
-    def mark_user_disconnected(self):
-        if self.user_id and self.room_id:
+    async def read_receipt_broadcast(self, event):
+        """Send read receipt to WebSocket"""
+        await self.send(text_data=json.dumps({
+            'type': 'read_receipt',
+            'message_id': event['message_id'],
+            'user_id': event['user_id'],
+            'timestamp': event['timestamp']
+        }))
+
+    # Database operations
+    async def authenticate_user(self, token):
+        """Authenticate user from JWT token with better error handling"""
+        if not token:
+            return None
+        
+        try:
+            # Try to decode without verification first to check expiration
             try:
-                room = Room.objects.get(room_id=self.room_id)
-                RoomParticipant.objects.filter(
-                    room=room,
-                    user_id=self.user_id
-                ).update(is_connected=False)
-            except Room.DoesNotExist:
-                pass
+                payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'], options={"verify_exp": False})
+            except jwt.DecodeError:
+                return None
+            
+            # Check expiration manually
+            from datetime import datetime
+            exp = payload.get('exp')
+            if exp and datetime.fromtimestamp(exp) < datetime.now():
+                # Don't send message here as connection might not be established
+                return None
+            
+            # Now verify properly
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
+            user_id = payload.get('user_id')
+            user = await database_sync_to_async(User.objects.get)(id=user_id)
+            return user
+            
+        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, User.DoesNotExist) as e:
+            print(f"Token authentication error: {e}")
+            return None
+
+    @database_sync_to_async
+    def refresh_access_token(self, refresh_token_str):
+        """Refresh the access token"""
+        try:
+            refresh = RefreshToken(refresh_token_str)
+            return {
+                'access': str(refresh.access_token),
+                'refresh': str(refresh)
+            }
+        except TokenError as e:
+            raise Exception(f"Token refresh failed: {str(e)}")
+
+    @database_sync_to_async
+    def save_message(self, message_text, media):
+        """Save message to database with media attachments"""
+    
+        
+        message = Message.objects.create(
+            room_id=self.room_id,
+            sender=self.user,
+            message=message_text,
+            sender_type='user'
+        )
+        
+        media_list = []
+        for media_item in media:
+            try:
+                file_data = media_item.get('data', '')
+                file_name = media_item.get('name', 'attachment')
+                file_type = media_item.get('type', 'application/octet-stream')
+                
+                # Decode base64
+                if isinstance(file_data, str) and file_data.startswith('data:'):
+                    try:
+                        format_part, filestr = file_data.split(';base64,')
+                        file_data = base64.b64decode(filestr)
+                    except (ValueError, Exception) as e:
+                        print(f"Error decoding base64: {e}")
+                        continue
+                
+                # Create attachment
+                attachment = Attachment.objects.create(
+                    message=message,
+                    file=ContentFile(file_data, name=file_name),
+                    file_type=file_type,
+                    original_filename=file_name,
+                    file_size=len(file_data) if isinstance(file_data, bytes) else media_item.get('size', 0)
+                )
+                
+                media_list.append({
+                    'id': attachment.id,
+                    'name': attachment.original_filename,
+                    'type': attachment.file_type,
+                    'size': attachment.file_size,
+                    'url': attachment.file.url if attachment.file else None
+                })
+            except Exception as e:
+                print(f"Error saving attachment: {e}")
+                continue
+        
+        return {
+            'id': message.id,
+            'message': message.message,
+            'sender': 'user',
+            'sender_id': self.user.id,
+            'sender_name': getattr(self.user, "name", self.user.name),
+            'created_at': message.created_at.isoformat(),
+            'media': media_list
+        }
+
+    @database_sync_to_async
+    def get_messages(self, limit, offset):
+        """Fetch messages from database with pagination"""
+        messages = Message.objects.filter(
+            room_id=self.room_id
+        ).select_related('sender').prefetch_related('attachments').order_by('-created_at')[offset:offset + limit]
+        
+        # Convert to list and reverse for chronological order
+        messages_list = list(messages)
+        messages_list.reverse()  # Oldest first for prepending
+        
+        return [{
+            'id': msg.id,
+            'message': msg.message,
+            'sender': msg.sender_type,
+            'sender_id': msg.sender.id,
+            'sender_name': getattr(msg.sender, "name", msg.sender.name),
+            'created_at': msg.created_at.isoformat(),
+            'media': [{
+                'id': att.id,
+                'name': att.original_filename,
+                'type': att.file_type,
+                'size': att.file_size,
+                'url': att.file.url if att.file else None
+            } for att in msg.attachments.all()]
+        } for msg in messages_list]
+
+    @database_sync_to_async
+    def get_total_messages(self):
+        """Get total message count for pagination"""
+        return Message.objects.filter(room_id=self.room_id).count()
+
+    @database_sync_to_async
+    def mark_message_read(self, message_id):
+        """Mark message as read"""
+        
+        try:
+            message = Message.objects.get(id=message_id)
+            pass
+        except Exception as e:
+            print(f"Error marking message as read: {e}")

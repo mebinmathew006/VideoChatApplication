@@ -83,3 +83,31 @@ class RoomSerializer(serializers.ModelSerializer):
         if obj.owner.name:
             return obj.owner.name
         return obj.owner.email
+    
+from rest_framework import serializers
+from .models import Room, Message, Attachment, User
+
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'name', 'email']
+
+class AttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Attachment
+        fields = ['id', 'file_url', 'file_type', 'original_filename', 'file_size']
+
+class MessageSerializer(serializers.ModelSerializer):
+    sender = UserSerializer(read_only=True)
+    attachments = AttachmentSerializer(many=True, read_only=True)
+    
+    class Meta:
+        model = Message
+        fields = ['id', 'message', 'sender', 'sender_type', 'created_at', 'attachments']
+
+class RoomSerializer(serializers.ModelSerializer):
+    owner = UserSerializer(read_only=True)
+    
+    class Meta:
+        model = Room
+        fields = ['id', 'name', 'description', 'participants', 'is_active', 'owner', 'created_at']

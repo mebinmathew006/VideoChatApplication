@@ -8,9 +8,11 @@ from .serializers import UserSignupSerializer,LoginSerializer
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.shortcuts import get_object_or_404
-from .models import Room
-from .serializers import RoomSerializer
-
+from .serializers import RoomSerializer,MessageSerializer
+from .models import Room, Message, User
+from jwt import decode
+from rest_framework_simplejwt.exceptions import TokenError
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +86,6 @@ class Login(APIView):
             email =serializer.validated_data['email']
             password = serializer.validated_data['password']
             user = authenticate(request, username=email, password=password)
-            logger.warning(f"User signup validation failed: {email},{password},{user}")
 
             if user:
                 refresh_token= RefreshToken.for_user(user)
@@ -104,7 +105,7 @@ class Login(APIView):
                             httponly=True,
                             secure=False,
                             samesite=None,
-                            max_age=60 * 60 * 24 
+                            max_age=60 * 60 * 24 ,
                         )
                 
                 return response
@@ -282,3 +283,93 @@ class RoomDetailView(APIView):
         room_name = room.name
         room.delete()
         return Response({"message": f'Room "{room_name}" deleted successfully'}, status=200)
+
+class RoomListCreateAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """List all rooms the user is part of"""
+        user = request.user
+        rooms = Room.objects.filter(owner=user) | Room.objects.filter(participants__contains=user.id)
+        serializer = RoomSerializer(rooms, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        """Create a new room"""
+        serializer = RoomSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(owner=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class RoomJoinLeaveAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk, action):
+        """Join or leave a room"""
+        room = get_object_or_404(Room, pk=pk)
+
+        if action == "join":
+            room.participants += 1
+            room.save()
+            return Response({"status": "joined room"}, status=status.HTTP_200_OK)
+
+        elif action == "leave":
+            room.participants = max(0, room.participants - 1)
+            room.save()
+            return Response({"status": "left room"}, status=status.HTTP_200_OK)
+
+        return Response({"error": "Invalid action"}, status=status.HTTP_400_BAD_REQUEST)
+
+# -------------------- MESSAGE VIEWS --------------------
+
+class MessageListAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """Get all messages for a given room"""
+        room_id = request.query_params.get('room_id')
+        if not room_id:
+            return Response({"error": "room_id parameter required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        messages = Message.objects.filter(room_id=room_id).select_related('sender').prefetch_related('attachments')
+        serializer = MessageSerializer(messages, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    
+class TokenRefreshFromCookieView(APIView):
+    permission_classes = [AllowAny]
+    def post(self, request):
+        # Extract the refresh token from cookies
+        refresh_token = request.COOKIES.get('refresh_token')
+        if not refresh_token:
+            return Response(
+                {"detail": "Refresh token not provided."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            # Create a RefreshToken instance and generate a new access token
+            refresh = RefreshToken(refresh_token)
+            access_token = str(refresh.access_token)
+
+            # Decode refresh token
+            refresh_payload = decode(refresh_token, settings.SECRET_KEY, algorithms=["HS256"])
+            user_id = refresh_payload['user_id']
+           
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+
+            # Create response with access token and user details in body
+            response = Response({
+                    'access_token': access_token,
+            }, status=status.HTTP_200_OK)
+            return response
+        except TokenError as e:
+            return Response(
+                {"detail": f"Invalid or expired refresh token.{e}"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )

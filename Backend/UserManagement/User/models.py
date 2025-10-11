@@ -31,30 +31,40 @@ class User(AbstractBaseUser):
     
 
 class Room(models.Model):
-    ROOM_TYPES = [
-        ("video", "Video"),
-        ("chat", "Chat"),
-    ]
-   
+    
     name = models.CharField(max_length=120)
-    type = models.CharField(max_length=10, choices=ROOM_TYPES, default="chat")
     participants = models.PositiveIntegerField(default=0)   
     description = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)
     owner = models.ForeignKey(User,on_delete=models.CASCADE, related_name="rooms" )
 
-    def __str__(self):
-        return f"{self.name} ({self.type}, {self.privacy})"
 
-class RoomParticipant(models.Model):
-    room = models.ForeignKey(Room, on_delete=models.CASCADE, related_name='room_participants')
-    user_id = models.CharField(max_length=100)  
-    joined_at = models.DateTimeField(auto_now_add=True)
-    is_connected = models.BooleanField(default=True)
+class Message(models.Model):
+    room = models.ForeignKey(Room, on_delete=models.CASCADE, related_name='messages')
+    sender = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sent_messages')
+    message = models.TextField(blank=True, null=True)
+    sender_type = models.CharField(max_length=20, default='user')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_read = models.BooleanField(default=False)
     
     class Meta:
-        unique_together = ['room', 'user_id']
+        ordering = ['created_at']
     
     def __str__(self):
-        return f"{self.user_id} in {self.room.room_id}"
+        return f"{self.sender.name}: {self.message[:50]}"
+
+
+class Attachment(models.Model):
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name='attachments')
+    file = models.FileField(upload_to='chat_attachments/%Y/%m/%d/', blank=True, null=True)
+    file_url = models.URLField(blank=True, null=True)
+    file_type = models.CharField(max_length=100)
+    original_filename = models.CharField(max_length=255)
+    file_size = models.IntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    def __str__(self):
+        return f"{self.original_filename} - {self.message.id}"
+
