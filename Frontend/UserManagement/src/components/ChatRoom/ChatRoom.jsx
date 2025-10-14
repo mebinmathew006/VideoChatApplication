@@ -4,43 +4,36 @@ import MessagesContainer from "../chat/MessagesContainer";
 import InputArea from "../chat/InputArea";
 import { Film, Image, FileText } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
-import { useDispatch, useSelector } from "react-redux";
+import { useSelector } from "react-redux";
 import MediaPreview from "../chat/MediaPreview";
-import { updateAccessToken } from "../../store/UserDetailsSlice";
-import axios from "axios";
+import { useChatWebSocket } from "../../utils/useChatWebSocket";
 
 export default function ChatRoom() {
   const navigate = useNavigate();
   const location = useLocation();
-  const dispatch = useDispatch()
   const { roomId, roomName } = location.state || {};
   const username = useSelector((state) => state.userDetails.name);
   const token = useSelector((state) => state.userDetails.access_token);
-  const baseurl = import.meta.env.VITE_BASE_URL;
-  const wsBaseurl = import.meta.env.VITE_BASE_URL_WS;
 
-  const [messages, setMessages] = useState([]);
+  const {
+    messages,
+    isConnected,
+    tokenExpired,
+    isLoadingMore,
+    hasMore,
+    totalMessages,
+    sendMessage,
+    loadMoreMessages,
+    disconnect,
+    refreshTokenViaAPI,
+  } = useChatWebSocket(roomId, token, username);
+
   const [inputMessage, setInputMessage] = useState("");
-  const [isConnected, setIsConnected] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [previewUrls, setPreviewUrls] = useState([]);
-  const [tokenExpired, setTokenExpired] = useState(false);
 
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState(true);
-  const [totalMessages, setTotalMessages] = useState(0);
-  const [messageOffset, setMessageOffset] = useState(0);
-  
-  const wsRef = useRef(null);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
-  const accessTokenRef = useRef(token);
-
-  useEffect(() => {
-    accessTokenRef.current = token;
-  }, [token]);
-
-
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -49,212 +42,6 @@ export default function ChatRoom() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
-
-  // Token expiration checker
-  useEffect(() => {
-    const checkTokenExpiry = () => {
-      const token = accessTokenRef.current;
-      if (!token) return;
-
-      try {
-        const payload = JSON.parse(atob(token.split('.')[1]));
-        const expiresAt = payload.exp * 1000; 
-        const timeUntilExpiry = expiresAt - Date.now();
-        if (timeUntilExpiry < 2 * 60 * 1000) {
-          console.log('Token expiring soon, refreshing...');
-          refreshTokenViaAPI();
-        }
-      } catch (error) {
-        console.error('Error checking token expiry:', error);
-      }
-    };
-
-    // Check token every 30 seconds
-    const tokenCheckInterval = setInterval(checkTokenExpiry, 30000);
-    
-    // Initial check
-    checkTokenExpiry();
-
-    return () => clearInterval(tokenCheckInterval);
-  }, []);
-
-  const connectWebSocket = () => {
-    const token = accessTokenRef.current;
-    if (!token) {
-      console.error("No token available for WebSocket connection");
-      return;
-    }
-
-    const wsUrl = `${wsBaseurl}/ws/chat/${roomId}/?token=${token}`;
-
-    try {
-      const ws = new WebSocket(wsUrl);
-      ws.onopen = () => {
-        console.log("WebSocket Connected");
-        setIsConnected(true);
-        setTokenExpired(false);
-      };
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          console.log("Message received:", data);
-
-          if (data.type === "message_history") {
-            const formattedMessages = formatMessages(data.messages);
-            setMessages((prev) =>
-              data.offset === 0
-                ? formattedMessages
-                : [...formattedMessages, ...prev]
-            );
-            setTotalMessages(data.total);
-            setHasMore(data.has_more);
-            setMessageOffset(data.offset + data.messages.length);
-            setIsLoadingMore(false);
-          } else if (data.type === "chat_message") {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: data.id,
-                username: data.username,
-                message: data.message,
-                media: data.media || [],
-                sender_id: data.sender_id,
-                timestamp: new Date(data.timestamp).toLocaleTimeString(),
-              },
-            ]);
-          } else if (data.type === "token_refreshed") {
-            // Update token ref with new token
-            accessTokenRef.current = data.access_token;
-            console.log("Token refreshed successfully via WebSocket");
-            setTokenExpired(false);
-          } else if (data.type === "token_error" || data.type === "auth_error") {
-            console.error("Token error:", data.message);
-            setTokenExpired(true);
-            // Try to refresh via API if WebSocket refresh failed
-            refreshTokenViaAPI();
-          } else if (data.type === "connection_established") {
-            console.log("WebSocket connection established");
-          } else if (data.type === "user_join" || data.type === "user_leave") {
-            // Handle user join/leave notifications
-            console.log(data.message);
-          }
-        } catch (error) {
-          console.error("Error parsing message:", error);
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error("WebSocket error:", error);
-        setIsConnected(false);
-      };
-
-      ws.onclose = (event) => {
-        console.log("WebSocket Disconnected", event.code, event.reason);
-        setIsConnected(false);
-        
-        // If closed due to authentication error, try to refresh
-        if (event.code === 4001 || event.code === 4000) {
-          setTokenExpired(true);
-          refreshTokenViaAPI();
-        }
-      };
-
-      wsRef.current = ws;
-    } catch (error) {
-      console.error("WebSocket connection error:", error);
-    }
-  };
-
-  // Refresh token via HTTP API (more reliable)
-  const refreshTokenViaAPI = async () => {
-    try {
-      const response = await axios.post(
-        `${baseurl}/v1/auth/refresh`,
-        {},
-        { withCredentials: true }
-      );
-      
-      const newAccessToken = response.data?.access_token;
-      
-      if (!newAccessToken) {
-        throw new Error("Missing access token in refresh response");
-      }
-      
-      accessTokenRef.current = newAccessToken;
-      dispatch(updateAccessToken(newAccessToken));
-      console.log('Token refreshed successfully via API');
-      setTokenExpired(false);
-      
-      // Reconnect WebSocket with new token
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-      setTimeout(() => connectWebSocket(), 1000);
-      
-    } catch (error) {
-      console.error('Token refresh error via API:', error);
-      navigate('/');
-    }
-  };
-
-  // Refresh token via WebSocket (alternative method)
-  const refreshTokenViaWebSocket = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: "refresh_token",
-        })
-      );
-    } else {
-      // Fallback to API refresh
-      refreshTokenViaAPI();
-    }
-  };
-
-  useEffect(() => {
-    if (roomId) {
-      connectWebSocket();
-    } else {
-      console.error("No roomId provided");
-      navigate(-1);
-    }
-
-    return () => {
-      // Cleanup preview URLs
-      previewUrls.forEach((url) => {
-        if (url) URL.revokeObjectURL(url);
-      });
-      
-      // Close WebSocket connection
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-    };
-  }, [roomId]);
-
-  const formatMessages = (msgs) => {
-    return msgs.map((msg) => ({
-      id: msg.id,
-      username: msg.sender_name,
-      message: msg.message,
-      media: msg.media || [],
-      sender_id: msg.sender_id,
-      timestamp: new Date(msg.created_at).toLocaleTimeString(),
-    }));
-  };
-
-  const handleLoadMore = () => {
-    if (isLoadingMore || !hasMore || !isConnected) return;
-
-    setIsLoadingMore(true);
-    wsRef.current?.send(
-      JSON.stringify({
-        type: "fetch_messages",
-        limit: 20,
-        offset: messageOffset,
-      })
-    );
-  };
 
   const handleFileSelect = (e) => {
     const files = Array.from(e.target.files);
@@ -287,11 +74,10 @@ export default function ChatRoom() {
     });
   };
 
-  const sendMessage = async () => {
+  const handleSendMessage = async () => {
     if (
       (!inputMessage.trim() && selectedFiles.length === 0) ||
-      !wsRef.current ||
-      wsRef.current.readyState !== WebSocket.OPEN
+      !isConnected
     ) {
       return;
     }
@@ -320,27 +106,26 @@ export default function ChatRoom() {
     }
 
     console.log("Sending message:", message);
-    wsRef.current.send(JSON.stringify(message));
-    setInputMessage("");
-    setSelectedFiles([]);
-    previewUrls.forEach((url) => url && URL.revokeObjectURL(url));
-    setPreviewUrls([]);
+    const success = sendMessage(message);
+    
+    if (success) {
+      setInputMessage("");
+      setSelectedFiles([]);
+      previewUrls.forEach((url) => url && URL.revokeObjectURL(url));
+      setPreviewUrls([]);
+    }
   };
 
   const handleKeyPress = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      handleSendMessage();
     }
   };
 
-  const leaveRoom = () => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    setIsConnected(false);
-    setMessages([]);
+  const handleLeaveRoom = () => {
+    disconnect();
+    setInputMessage("");
     setSelectedFiles([]);
     previewUrls.forEach((url) => url && URL.revokeObjectURL(url));
     setPreviewUrls([]);
@@ -385,7 +170,7 @@ export default function ChatRoom() {
           roomId={roomId}
           roomName={roomName}
           isConnected={isConnected}
-          onLeave={leaveRoom}
+          onLeave={handleLeaveRoom}
           messageCount={totalMessages}
         />
 
@@ -398,7 +183,7 @@ export default function ChatRoom() {
           MediaPreview={MediaPreview}
           isLoadingMore={isLoadingMore}
           hasMore={hasMore}
-          onLoadMore={handleLoadMore}
+          onLoadMore={loadMoreMessages}
         />
 
         <InputArea
@@ -410,7 +195,7 @@ export default function ChatRoom() {
           onKeyPress={handleKeyPress}
           onFileSelect={handleFileSelect}
           onRemoveFile={removeFile}
-          onSendMessage={sendMessage}
+          onSendMessage={handleSendMessage}
           fileInputRef={fileInputRef}
           getFileIcon={getFileIcon}
           formatFileSize={formatFileSize}

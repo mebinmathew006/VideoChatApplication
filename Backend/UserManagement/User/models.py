@@ -22,7 +22,7 @@ class User(AbstractBaseUser):
     
     USERNAME_FIELD = 'email'
     
-    REQUIRED_FIELDS = ['profile_image','name']
+    REQUIRED_FIELDS = ['name']
     
     objects = UserManger()
         
@@ -33,7 +33,6 @@ class User(AbstractBaseUser):
 class Room(models.Model):
     
     name = models.CharField(max_length=120)
-    participants = models.PositiveIntegerField(default=0)   
     description = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)

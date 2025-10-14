@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, {  useState } from "react";
 import { Eye, EyeOff, Home } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useDispatch } from "react-redux";
@@ -131,6 +131,7 @@ export default function LoginPage() {
                   <div className="relative">
                     <input
                       id="password"
+                      aria-label="password"
                       name="password"
                       type={showPassword ? "text" : "password"}
                       autoComplete="current-password"
@@ -142,6 +143,7 @@ export default function LoginPage() {
                     <div className="absolute inset-y-0 right-0 pr-3 flex items-center">
                       <button
                         type="button"
+                        aria-label="Toggle password visibility"
                         onClick={() => setShowPassword(!showPassword)}
                         className="text-gray-400 hover:text-gray-500 focus:outline-none"
                       >

@@ -15,7 +15,6 @@ const AppRoutes = () => {
       <Route path="/signup" element={<SignupPage />} />
       <Route path="/room" element={<RoomCreation />} />
       <Route path="/home" element={<RoomsDashboard />} />
-      {/* <Route path="/chat" element={<UserChat />} /> */}
       <Route path="/chat" element={<ChatRoom />} />
       <Route path="*" element={<NotFound />} />
     </Routes>

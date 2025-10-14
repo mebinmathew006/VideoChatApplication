@@ -6,13 +6,16 @@ from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
 from User.models import Message, Attachment
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 import jwt
 from django.conf import settings
+import logging
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
+
 
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
@@ -23,14 +26,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
         
         self.user = await self.authenticate_user(token)
         
+        # FIX: Check authentication first and reject immediately if failed
         if not self.user or not self.user.is_authenticated:
-            await self.send(text_data=json.dumps({
-                'type': 'auth_error',
-                'message': 'Authentication failed'
-            }))
-            await self.close(code=4001)  
+            # Reject the connection immediately without sending any messages
+            await self.close(code=4001)
             return
 
+        # Only accept the connection if authentication succeeds
         await self.channel_layer.group_add(
             self.room_group_name,
             self.channel_name
@@ -38,6 +40,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         await self.accept()
 
+        # Now you can send messages after accept()
         await self.send(text_data=json.dumps({
             'type': 'connection_established',
             'message': 'Connected to chat',
@@ -90,12 +93,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 await self.handle_chat_message(data)
             elif message_type == 'join':
                 pass
-            elif message_type == 'typing':
-                await self.handle_typing(data)
             elif message_type == 'fetch_messages':
                 await self.handle_fetch_messages(data)
-            elif message_type == 'read_receipt':
-                await self.handle_read_receipt(data)
             elif message_type == 'refresh_token':
                 await self.handle_refresh_token(data)
                 
@@ -105,7 +104,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 'message': 'Invalid JSON format'
             }))
         except Exception as e:
-            print(f"Error in receive: {str(e)}")
+            logger.info(f"Error in receive: {str(e)}")
             await self.send(text_data=json.dumps({
                 'type': 'error',
                 'message': str(e)
@@ -129,20 +128,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             }
         )
 
-    async def handle_typing(self, data):
-        """Handle typing indicator"""
-        is_typing = data.get('is_typing', False)
-        
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                'type': 'typing_indicator',
-                'user_id': self.user.id,
-                'user_name': getattr(self.user, "name", self.user.name),
-                'is_typing': is_typing
-            }
-        )
-
     async def handle_fetch_messages(self, data):
         """Handle pagination - fetch older messages"""
         try:
@@ -161,27 +146,11 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 'has_more': offset + len(messages) < total
             }))
         except Exception as e:
-            print(f"Error fetching messages: {e}")
+            logger.info(f"Error fetching messages: {e}")
             await self.send(text_data=json.dumps({
                 'type': 'error',
                 'message': 'Failed to load messages'
             }))
-
-    async def handle_read_receipt(self, data):
-        """Handle message read receipts"""
-        message_id = data.get('message_id')
-        
-        await self.mark_message_read(message_id)
-        
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                'type': 'read_receipt_broadcast',
-                'message_id': message_id,
-                'user_id': self.user.id,
-                'timestamp': datetime.now().isoformat()
-            }
-        )
 
     async def handle_refresh_token(self, data):
         """Handle token refresh"""
@@ -220,16 +189,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             'timestamp': event['message']['created_at']
         }))
 
-    async def typing_indicator(self, event):
-        """Send typing indicator to WebSocket"""
-        if event['user_id'] != self.user.id:
-            await self.send(text_data=json.dumps({
-                'type': 'typing',
-                'user_id': event['user_id'],
-                'user_name': event['user_name'],
-                'is_typing': event['is_typing']
-            }))
-
     async def user_join(self, event):
         """Send user join notification"""
         if event['user_id'] != self.user.id:
@@ -252,15 +211,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 'timestamp': event['timestamp']
             }))
 
-    async def read_receipt_broadcast(self, event):
-        """Send read receipt to WebSocket"""
-        await self.send(text_data=json.dumps({
-            'type': 'read_receipt',
-            'message_id': event['message_id'],
-            'user_id': event['user_id'],
-            'timestamp': event['timestamp']
-        }))
-
     # Database operations
     async def authenticate_user(self, token):
         """Authenticate user from JWT token with better error handling"""
@@ -278,7 +228,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             from datetime import datetime
             exp = payload.get('exp')
             if exp and datetime.fromtimestamp(exp) < datetime.now():
-                # Don't send message here as connection might not be established
                 return None
             
             # Now verify properly
@@ -288,7 +237,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             return user
             
         except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, User.DoesNotExist) as e:
-            print(f"Token authentication error: {e}")
+            logger.info(f"Token authentication error: {e}")
             return None
 
     @database_sync_to_async
@@ -306,8 +255,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def save_message(self, message_text, media):
         """Save message to database with media attachments"""
-    
-        
         message = Message.objects.create(
             room_id=self.room_id,
             sender=self.user,
@@ -328,7 +275,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                         format_part, filestr = file_data.split(';base64,')
                         file_data = base64.b64decode(filestr)
                     except (ValueError, Exception) as e:
-                        print(f"Error decoding base64: {e}")
+                        logger.info(f"Error decoding base64: {e}")
                         continue
                 
                 # Create attachment
@@ -348,7 +295,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     'url': attachment.file.url if attachment.file else None
                 })
             except Exception as e:
-                print(f"Error saving attachment: {e}")
+                logger.info(f"Error saving attachment: {e}")
                 continue
         
         return {
@@ -396,9 +343,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def mark_message_read(self, message_id):
         """Mark message as read"""
-        
         try:
             message = Message.objects.get(id=message_id)
             pass
         except Exception as e:
-            print(f"Error marking message as read: {e}")
+            logger.info(f"Error marking message as read: {e}")

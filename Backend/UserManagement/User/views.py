@@ -7,15 +7,22 @@ from django.core.exceptions import ValidationError
 from .serializers import UserSignupSerializer,LoginSerializer
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
-from django.shortcuts import get_object_or_404
-from .serializers import RoomSerializer,MessageSerializer
-from .models import Room, Message, User
+from .serializers import RoomSerializer
+from .models import Room, User
+from django.db.models import Q
 from jwt import decode
 from rest_framework_simplejwt.exceptions import TokenError
 from django.conf import settings
+from rest_framework.pagination import PageNumberPagination
+
 
 logger = logging.getLogger(__name__)
 
+
+class PaginationClass(PageNumberPagination):
+    page_size = 6
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 
 class UserSignupView(APIView):
     permission_classes = [AllowAny] 
@@ -107,14 +114,11 @@ class Login(APIView):
                             samesite=None,
                             max_age=60 * 60 * 24 ,
                         )
-                
                 return response
-              
             return Response(
                     {
                         "status":"error",
                         "message":"Invalid Credentials",
-                       
                     },
                     status=status.HTTP_400_BAD_REQUEST
                 )
@@ -132,34 +136,35 @@ class Login(APIView):
 
 class RoomListCreateView(APIView):
     permission_classes = [IsAuthenticated]
+    pagination_class = PaginationClass
 
     def get(self, request):
         """
-        List all active rooms with optional filtering
+        List all active rooms of the authenticated user with optional search and pagination.
         """
         try:
-            room_type = request.GET.get("type", None)
             search = request.GET.get("search", "").strip()
             is_active = request.GET.get("active", "true").lower() == "true"
 
-            rooms = Room.objects.all()
+            # Filter rooms owned by current user and active status
+            rooms = Room.objects.filter(is_active=is_active)
 
-            if is_active is not None:
-                rooms = rooms.filter(is_active=is_active)
-
-            if room_type and room_type in ["video", "chat"]:
-                rooms = rooms.filter(type=room_type)
-
+            # Search by name or description
             if search:
-                rooms = rooms.filter(
-                    name__icontains=search
-                ) | Room.objects.filter(description__icontains=search)
+                rooms = rooms.filter(Q(name__icontains=search) | Q(description__icontains=search))
 
+            # Order by creation date descending
             rooms = rooms.order_by("-created_at")
 
-            serializer = RoomSerializer(rooms, many=True)
-            return Response({"rooms": serializer.data, "count": rooms.count()}, status=200)
+            # Pagination
+            paginator = self.pagination_class()
+            paginated_rooms = paginator.paginate_queryset(rooms, request)
+            serializer = RoomSerializer(paginated_rooms, many=True)
+
+            return paginator.get_paginated_response(serializer.data)
+
         except Exception as e:
+            logger.exception(f"{e} - Error fetching rooms")
             return Response(
                 {"error": "An error occurred while fetching rooms", "details": str(e)},
                 status=500,
@@ -167,176 +172,37 @@ class RoomListCreateView(APIView):
 
     def post(self, request):
         """
-        Create a new room with the authenticated user as owner
+        Create a new room with the authenticated user as owner.
         """
-        data = request.data
-        name = data.get("name", "").strip()
-        room_type = data.get("type", "chat")
-        description = data.get("description", "").strip()
+        try:
+            name = request.data.get("name", "").strip()
+            description = request.data.get("description", "").strip()
 
-       
-        if not name:
-            return Response(
-                {"error": "Room name is required", "field": "name"}, status=400
-            )
-
-        if len(name) > 120:
-            return Response(
-                {"error": "Room name cannot exceed 120 characters", "field": "name"},
-                status=400,
-            )
-
-        if room_type not in ["video", "chat"]:
-            return Response(
-                {"error": 'Room type must be either "video" or "chat"', "field": "type"},
-                status=400,
-            )
-
-        existing_room = Room.objects.filter(
-            owner=request.user, name__iexact=name
-        ).exists()
-        if existing_room:
-            return Response(
-                {"error": "You already have a room with this name", "field": "name"},
-                status=400,
-            )
-
-        room = Room.objects.create(
-            name=name,
-            type=room_type,
-            description=description,
-            owner=request.user,
-            participants=0,
-            is_active=True,
-        )
-
-        serializer = RoomSerializer(room)
-        return Response({"message": "Room created successfully", "room": serializer.data}, status=201)
-
-
-class RoomDetailView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request, room_id):
-        """
-        Get a specific room by ID
-        """
-        room = get_object_or_404(Room, id=room_id)
-        serializer = RoomSerializer(room)
-        return Response({"room": serializer.data}, status=200)
-
-    def put(self, request, room_id):
-        """
-        Update a room (only owner can update)
-        """
-        room = get_object_or_404(Room, id=room_id)
-
-        if room.owner != request.user:
-            return Response(
-                {"error": "You can only update rooms you created"}, status=403
-            )
-
-        data = request.data
-        if "name" in data:
-            name = data["name"].strip()
+            # Validation
             if not name:
-                return Response(
-                    {"error": "Room name cannot be empty", "field": "name"}, status=400
-                )
+                return Response({"error": "Room name is required", "field": "name"}, status=400)
             if len(name) > 120:
                 return Response(
-                    {"error": "Room name cannot exceed 120 characters", "field": "name"},
-                    status=400,
+                    {"error": "Room name cannot exceed 120 characters", "field": "name"}, status=400
                 )
-            room.name = name
 
-        if "type" in data:
-            room_type = data["type"]
-            if room_type not in ["video", "chat"]:
+            # Check duplicate room name for this user
+            if Room.objects.filter(owner=request.user, name__iexact=name).exists():
                 return Response(
-                    {"error": 'Room type must be either "video" or "chat"', "field": "type"},
-                    status=400,
+                    {"error": "You already have a room with this name", "field": "name"}, status=400
                 )
-            room.type = room_type
 
-        if "description" in data:
-            room.description = data["description"].strip()
+            # Create room
+            room = Room.objects.create(name=name, description=description, owner=request.user, is_active=True)
+            serializer = RoomSerializer(room)
+            return Response({"message": "Room created successfully", "room": serializer.data}, status=201)
 
-        if "is_active" in data:
-            room.is_active = bool(data["is_active"])
-
-        room.save()
-        serializer = RoomSerializer(room)
-        return Response({"message": "Room updated successfully", "room": serializer.data}, status=200)
-
-    def delete(self, request, room_id):
-        """
-        Delete a room (only owner can delete)
-        """
-        room = get_object_or_404(Room, id=room_id)
-
-        if room.owner != request.user:
+        except Exception as e:
+            logger.exception(f"{e} - Error creating room")
             return Response(
-                {"error": "You can only delete rooms you created"}, status=403
+                {"error": "An error occurred while creating the room", "details": str(e)},
+                status=500,
             )
-
-        room_name = room.name
-        room.delete()
-        return Response({"message": f'Room "{room_name}" deleted successfully'}, status=200)
-
-class RoomListCreateAPIView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        """List all rooms the user is part of"""
-        user = request.user
-        rooms = Room.objects.filter(owner=user) | Room.objects.filter(participants__contains=user.id)
-        serializer = RoomSerializer(rooms, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-
-    def post(self, request):
-        """Create a new room"""
-        serializer = RoomSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save(owner=request.user)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-class RoomJoinLeaveAPIView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request, pk, action):
-        """Join or leave a room"""
-        room = get_object_or_404(Room, pk=pk)
-
-        if action == "join":
-            room.participants += 1
-            room.save()
-            return Response({"status": "joined room"}, status=status.HTTP_200_OK)
-
-        elif action == "leave":
-            room.participants = max(0, room.participants - 1)
-            room.save()
-            return Response({"status": "left room"}, status=status.HTTP_200_OK)
-
-        return Response({"error": "Invalid action"}, status=status.HTTP_400_BAD_REQUEST)
-
-# -------------------- MESSAGE VIEWS --------------------
-
-class MessageListAPIView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        """Get all messages for a given room"""
-        room_id = request.query_params.get('room_id')
-        if not room_id:
-            return Response({"error": "room_id parameter required"}, status=status.HTTP_400_BAD_REQUEST)
-
-        messages = Message.objects.filter(room_id=room_id).select_related('sender').prefetch_related('attachments')
-        serializer = MessageSerializer(messages, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-    
     
 class TokenRefreshFromCookieView(APIView):
     permission_classes = [AllowAny]
